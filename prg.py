@@ -2,7 +2,7 @@ import cv2
 from ultralytics import YOLO
 
 # 1. Load your trained model 
-model = YOLO('best.pt') 
+model = YOLO('best.onnx') 
 
 # 2. THE CHANGE: Provide the path to your video file instead of '0'
 # Replace 'test_video.mp4' with the actual name of your video file
