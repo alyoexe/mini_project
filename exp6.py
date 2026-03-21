@@ -52,9 +52,19 @@ ENABLE_MEMORY_PROFILING = False  # Set to True to enable memory tracking
 PROFILE_INTERVAL = 30  # Print memory stats every N frames
 ENABLE_CROP_CACHE = True  # Cache crops to avoid redundant resizing
 ENABLE_BATCH_LIME = True  # Batch process multiple uncertain objects together
-BATCH_LIME_MAX = 2  # Max objects to batch together (higher = faster but more latency)
-NUM_LIME_WORKERS = 2  # Number of parallel LIME workers (1-4 recommended, higher = faster but more GPU/CPU)
-
+BATCH_LIME_MAX = 1  # Max objects to batch together (higher = faster but more latency)
+NUM_LIME_WORKERS = 1  # Number of parallel LIME workers (1-4 recommended, higher = faster but more GPU/CPU)
+# ========== LIME QUALITY OPTIONS ==========
+LIME_QUALITY_MODE = "fast"  # "fast" = simple, "balanced" = medium, "high" = detailed
+# fast:     10 samples, simple mask, no smoothing (fastest)
+# balanced: 20 samples, smoothed mask, contours (default)
+# high:     50 samples, detailed mask, contours (slowest but best quality)
+ENABLE_MASK_OVERLAY = False  # Show mask visualization (disable for speed)
+ENABLE_CONTOURS = False # Draw contours on mask (disable for speed)
+ENABLE_MASK_SMOOTH = False  # Apply Gaussian blur to mask (disable for speed and fast)
+ENABLE_INFRAME_LIME = False  # Blend LIME overlay back into detection frame
+SHOW_LIME_WINDOW = True  # Show separate tiled LIME window
+MAX_LIME_JOBS_PER_SEC = 1.5  # Global cap on new LIME jobs across all objects
 # ==========================================
 # UTILITY FUNCTIONS
 # ==========================================
@@ -150,31 +160,52 @@ def lime_worker(input_q, output_q, model_path):
         """Process single crop and return overlay."""
         overlay = None
         try:
+            # Adjust parameters based on quality mode
+            if LIME_QUALITY_MODE == "fast":
+                samples = 10
+                num_features = 4
+            elif LIME_QUALITY_MODE == "high":
+                samples = 50
+                num_features = 12
+            else:  # balanced
+                samples = 20
+                num_features = 6
+            
             exp = explainer.explain_instance(
                 crop,
                 predict_fn,
                 top_labels=1,
-                num_samples=NUM_LIME_SAMPLES,
+                num_samples=samples,
                 batch_size=LIME_BATCH_SIZE,
                 hide_color=0,
             )
 
             temp, mask = exp.get_image_and_mask(
                 exp.top_labels[0],
-                num_features=6,
+                num_features=num_features,
                 positive_only=True,
                 hide_rest=False,
             )
 
-            crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
-            mask_u8 = (mask > 0).astype(np.uint8) * 255
-            mask_u8 = cv2.GaussianBlur(mask_u8, (0, 0), 2)
-            heat = cv2.applyColorMap(mask_u8, cv2.COLORMAP_TURBO)
-            overlay = cv2.addWeighted(crop_bgr, 0.58, heat, 0.42, 0)
+            if not ENABLE_MASK_OVERLAY:
+                # Skip mask rendering for speed
+                overlay = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+            else:
+                crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+                mask_u8 = (mask > 0).astype(np.uint8) * 255
+                
+                # Optional smoothing
+                if ENABLE_MASK_SMOOTH:
+                    mask_u8 = cv2.GaussianBlur(mask_u8, (0, 0), 2)
+                
+                heat = cv2.applyColorMap(mask_u8, cv2.COLORMAP_TURBO)
+                overlay = cv2.addWeighted(crop_bgr, 0.58, heat, 0.42, 0)
 
-            contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                cv2.drawContours(overlay, contours, -1, (255, 255, 255), 1)
+                # Optional contours
+                if ENABLE_CONTOURS:
+                    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if contours:
+                        cv2.drawContours(overlay, contours, -1, (255, 255, 255), 1)
         except Exception as e:
             print("LIME error:", e)
         
@@ -265,6 +296,9 @@ def main():
     fps_smooth = 0.0
     lime_window_visible = False
     is_paused = False
+    last_global_lime_time = 0.0
+    runtime_inframe_lime = ENABLE_INFRAME_LIME
+    runtime_show_lime_window = SHOW_LIME_WINDOW
     
     # Performance tracking
     frame_count = 0
@@ -275,6 +309,16 @@ def main():
         tracemalloc.start()
         print("Memory profiling enabled")
 
+    print(
+        "LIME settings:",
+        f"mode={LIME_QUALITY_MODE}",
+        f"workers={NUM_LIME_WORKERS}",
+        f"mask_overlay={ENABLE_MASK_OVERLAY}",
+        f"inframe_overlay={runtime_inframe_lime}",
+        f"lime_window={runtime_show_lime_window}",
+        f"max_jobs_per_sec={MAX_LIME_JOBS_PER_SEC}",
+    )
+    print("Controls: q=quit, p=pause/resume, l=toggle LIME window, m=toggle in-frame LIME")
     print("Running...")
 
     try:
@@ -382,6 +426,10 @@ def main():
                                     - last_lime_time[obj_id]
                                     > LIME_COOLDOWN
                                 )
+                                and (
+                                    MAX_LIME_JOBS_PER_SEC <= 0
+                                    or time.time() - last_global_lime_time >= (1.0 / MAX_LIME_JOBS_PER_SEC)
+                                )
                                 and obj_id not in pending_lime_ids
                             ):
 
@@ -431,12 +479,14 @@ def main():
                                         pending_lime_ids.add(obj_id)
                                         pending_lime_started[obj_id] = time.time()
                                         last_lime_time[obj_id] = time.time()
+                                        last_global_lime_time = time.time()
                                     else:
                                         try:
                                             input_q.put_nowait((crop, cls, obj_id))
                                             pending_lime_ids.add(obj_id)
                                             pending_lime_started[obj_id] = time.time()
                                             last_lime_time[obj_id] = time.time()
+                                            last_global_lime_time = time.time()
                                         except queue.Full:
                                             pass
 
@@ -533,41 +583,42 @@ def main():
                             pinned_order.remove(obj_id)
 
                 # Blend LIME explanation directly inside each tracked bounding box.
-                for obj_id, (x1, y1, x2, y2) in current_boxes.items():
-                    if obj_id not in exp_store:
-                        continue
+                if runtime_inframe_lime:
+                    for obj_id, (x1, y1, x2, y2) in current_boxes.items():
+                        if obj_id not in exp_store:
+                            continue
 
-                    created = exp_store[obj_id]["created_at"]
-                    age = now - created
-                    if age <= EXPLANATION_HOLD_SEC:
-                        alpha = INFRAME_ALPHA
-                    elif age <= EXPLANATION_HOLD_SEC + EXPLANATION_FADE_SEC:
-                        t = (age - EXPLANATION_HOLD_SEC) / EXPLANATION_FADE_SEC
-                        alpha = INFRAME_ALPHA * max(0.0, 1.0 - t)
-                    else:
-                        alpha = 0.0
+                        created = exp_store[obj_id]["created_at"]
+                        age = now - created
+                        if age <= EXPLANATION_HOLD_SEC:
+                            alpha = INFRAME_ALPHA
+                        elif age <= EXPLANATION_HOLD_SEC + EXPLANATION_FADE_SEC:
+                            t = (age - EXPLANATION_HOLD_SEC) / EXPLANATION_FADE_SEC
+                            alpha = INFRAME_ALPHA * max(0.0, 1.0 - t)
+                        else:
+                            alpha = 0.0
 
-                    if alpha <= 0.0:
-                        continue
+                        if alpha <= 0.0:
+                            continue
 
-                    h_roi = y2 - y1
-                    w_roi = x2 - x1
-                    if h_roi < 2 or w_roi < 2:
-                        continue
+                        h_roi = y2 - y1
+                        w_roi = x2 - x1
+                        if h_roi < 2 or w_roi < 2:
+                            continue
 
-                    overlay = exp_store[obj_id]["overlay"]
-                    overlay_resized = cv2.resize(overlay, (w_roi, h_roi), interpolation=cv2.INTER_LINEAR)
-                    roi = frame[y1:y2, x1:x2]
-                    frame[y1:y2, x1:x2] = cv2.addWeighted(roi, 1.0 - alpha, overlay_resized, alpha, 0)
-                    cv2.putText(
-                        frame,
-                        f"LIME {int(alpha * 100)}%",
-                        (x1, y2 + 16),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        (0, 255, 255),
-                        1,
-                    )
+                        overlay = exp_store[obj_id]["overlay"]
+                        overlay_resized = cv2.resize(overlay, (w_roi, h_roi), interpolation=cv2.INTER_LINEAR)
+                        roi = frame[y1:y2, x1:x2]
+                        frame[y1:y2, x1:x2] = cv2.addWeighted(roi, 1.0 - alpha, overlay_resized, alpha, 0)
+                        cv2.putText(
+                            frame,
+                            f"LIME {int(alpha * 100)}%",
+                            (x1, y2 + 16),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            (0, 255, 255),
+                            1,
+                        )
 
         # -------- FPS --------
 
@@ -594,7 +645,7 @@ def main():
             cv2.imshow("Detection", frame)
 
         # Show a single tiled window to avoid opening many OS windows (reduces lag).
-            if pinned_order:
+            if runtime_show_lime_window and pinned_order:
                 tile_size = 192
                 cols = 2
                 active_ids = [oid for oid in list(pinned_order) if oid in exp_store]
@@ -658,6 +709,18 @@ def main():
                     print("Video paused. Press 'p' to resume or 'q' to quit.")
                 else:
                     print("Video resumed.")
+            elif key == ord("l"):
+                runtime_show_lime_window = not runtime_show_lime_window
+                if not runtime_show_lime_window and lime_window_visible:
+                    try:
+                        cv2.destroyWindow("LIME")
+                    except cv2.error:
+                        pass
+                    lime_window_visible = False
+                print(f"LIME window: {'ON' if runtime_show_lime_window else 'OFF'}")
+            elif key == ord("m"):
+                runtime_inframe_lime = not runtime_inframe_lime
+                print(f"In-frame LIME overlay: {'ON' if runtime_inframe_lime else 'OFF'}")
 
             # Keep playback smooth on slow hardware by dropping a few buffered frames.
             loop_elapsed = time.time() - curr
