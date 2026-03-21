@@ -6,6 +6,7 @@ import time
 from collections import deque
 from ultralytics import YOLO
 from lime import lime_image
+from lime.wrappers.scikit_image import SegmentationAlgorithm
 import tracemalloc
 import psutil
 import os
@@ -69,6 +70,7 @@ SHOW_LIME_WINDOW = True  # Show separate tiled LIME window
 MAX_LIME_JOBS_PER_SEC = 1.5  # Global cap on new LIME jobs across all objects
 SHOW_PERF_BREAKDOWN = True  # Overlay tracking latency and LIME throughput metrics
 LIME_POSITIVE_ONLY = False  # False shows both supporting and opposing evidence
+LIME_SEGMENTER = "slic_fast"  # "quickshift" (default LIME style) or "slic_fast"
 # ==========================================
 # UTILITY FUNCTIONS
 # ==========================================
@@ -168,12 +170,30 @@ def lime_worker(input_q, output_q, model_path):
             if LIME_QUALITY_MODE == "fast":
                 samples = max(8, NUM_LIME_SAMPLES // 2)
                 num_features = 4
+                slic_segments = 24
+                slic_compactness = 8
             elif LIME_QUALITY_MODE == "high":
                 samples = max(50, NUM_LIME_SAMPLES * 2)
                 num_features = 12
+                slic_segments = 72
+                slic_compactness = 12
             else:  # balanced
                 samples = max(20, NUM_LIME_SAMPLES)
                 num_features = 6
+                slic_segments = 40
+                slic_compactness = 10
+
+            # Use a lightweight SLIC setup for faster superpixel generation on small crops.
+            if LIME_SEGMENTER == "slic_fast":
+                segmentation_fn = SegmentationAlgorithm(
+                    "slic",
+                    n_segments=slic_segments,
+                    compactness=slic_compactness,
+                    sigma=0,
+                    start_label=0,
+                )
+            else:
+                segmentation_fn = None
             
             exp = explainer.explain_instance(
                 crop,
@@ -182,6 +202,7 @@ def lime_worker(input_q, output_q, model_path):
                 num_samples=samples,
                 batch_size=LIME_BATCH_SIZE,
                 hide_color=0,
+                segmentation_fn=segmentation_fn,
             )
 
             temp, mask = exp.get_image_and_mask(
@@ -356,6 +377,9 @@ def main():
 
                 if not ret:
                     break
+
+                # Keep an unannotated copy for LIME crops.
+                raw_frame = frame.copy()
                 
                 # Skip frames for performance
                 if FRAME_SKIP > 0:
@@ -460,7 +484,7 @@ def main():
                                 and obj_id not in pending_lime_ids
                             ):
 
-                                h, w = frame.shape[:2]
+                                h, w = raw_frame.shape[:2]
 
                                 x1 = max(0, x1)
                                 y1 = max(0, y1)
@@ -470,7 +494,7 @@ def main():
                                 if x2 <= x1 or y2 <= y1:
                                     continue
 
-                                crop = frame[y1:y2, x1:x2]
+                                crop = raw_frame[y1:y2, x1:x2]
 
                                 if (
                                     crop.size > 0
