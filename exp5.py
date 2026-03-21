@@ -19,7 +19,7 @@ if hasattr(lime_image, "tqdm"):
 # ================= CONFIG =================
 
 MODEL_PATH = "best.onnx"
-VIDEO_SOURCE = "test_video.mp4"
+VIDEO_SOURCE = "test_vid.mp4"
 
 LOWER_THRESH = 0.40
 UPPER_THRESH = 0.75
