@@ -6,7 +6,14 @@ import time
 from collections import deque
 from ultralytics import YOLO
 from lime import lime_image
-from skimage.segmentation import mark_boundaries
+
+
+def _silent_tqdm(iterable, *args, **kwargs):
+    return iterable
+
+
+if hasattr(lime_image, "tqdm"):
+    lime_image.tqdm = _silent_tqdm
 
 
 # ================= CONFIG =================
@@ -27,7 +34,14 @@ MIN_CROP_SIDE = 6
 MAX_PENDING_JOBS = 8
 MAX_LIME_TILES = 4
 TRACK_IMGSZ = 640
+LIME_IMGSZ = 160
+INFER_SCALE = 0.75
 PENDING_JOB_TIMEOUT = 15.0
+UNCERTAIN_STREAK_FRAMES = 10
+EXPLANATION_HOLD_SEC = 2.5
+EXPLANATION_FADE_SEC = 3.5
+LOST_TRACK_GRACE_SEC = 1.5
+INFRAME_ALPHA = 0.55
 
 # ==========================================
 # LIME WORKER
@@ -66,7 +80,7 @@ def lime_worker(input_q, output_q, model_path):
                 img = np.ascontiguousarray(img)
 
             try:
-                r = model(img, imgsz=TRACK_IMGSZ, verbose=False)
+                r = model(img, imgsz=LIME_IMGSZ, verbose=False)
                 if len(r[0].boxes) == 0:
                     continue
 
@@ -105,15 +119,20 @@ def lime_worker(input_q, output_q, model_path):
 
             temp, mask = exp.get_image_and_mask(
                 exp.top_labels[0],
-                num_features=3,
+                num_features=6,
                 positive_only=True,
                 hide_rest=False,
             )
 
-            overlay = mark_boundaries(temp / 255.0, mask)
+            crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+            mask_u8 = (mask > 0).astype(np.uint8) * 255
+            mask_u8 = cv2.GaussianBlur(mask_u8, (0, 0), 2)
+            heat = cv2.applyColorMap(mask_u8, cv2.COLORMAP_TURBO)
+            overlay = cv2.addWeighted(crop_bgr, 0.58, heat, 0.42, 0)
 
-            overlay = (overlay * 255).astype(np.uint8)
-            overlay = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+            contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cv2.drawContours(overlay, contours, -1, (255, 255, 255), 1)
 
         except Exception as e:
             print("LIME error:", e)
@@ -165,18 +184,21 @@ def main():
     if fps_video == 0:
         fps_video = 25
 
-    delay = int(1000 / fps_video)
+    frame_interval = 1.0 / fps_video
 
     uncertain_times = {}
+    uncertain_streak = {}
     last_lime_time = {}
     pending_lime_ids = set()
     pending_lime_started = {}
 
-    latest_exp = {}
-    latest_exp_order = deque(maxlen=MAX_LIME_TILES)
+    # Per-object explanation memory for persistence and fade-out.
+    exp_store = {}
+    pinned_order = deque(maxlen=MAX_LIME_TILES)
 
     prev = time.time()
     fps_smooth = 0.0
+    lime_window_visible = False
 
     print("Running...")
 
@@ -193,8 +215,20 @@ def main():
             if not ret:
                 break
 
+            infer_frame = frame
+            scale_back = 1.0
+            if 0.0 < INFER_SCALE < 1.0:
+                infer_frame = cv2.resize(
+                    frame,
+                    None,
+                    fx=INFER_SCALE,
+                    fy=INFER_SCALE,
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                scale_back = 1.0 / INFER_SCALE
+
             results = model.track(
-                frame,
+                infer_frame,
                 persist=True,
                 tracker="bytetrack.yaml",
                 imgsz=TRACK_IMGSZ,
@@ -202,6 +236,7 @@ def main():
             )
 
             current_ids = set()
+            current_boxes = {}
 
             for r in results:
 
@@ -215,13 +250,18 @@ def main():
 
                     obj_id = int(obj_id)
 
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    x1i, y1i, x2i, y2i = map(int, box.xyxy[0])
+                    x1 = int(x1i * scale_back)
+                    y1 = int(y1i * scale_back)
+                    x2 = int(x2i * scale_back)
+                    y2 = int(y2i * scale_back)
                     conf = float(box.conf[0])
                     cls = int(box.cls[0])
 
                     name = model.names[cls]
 
                     current_ids.add(obj_id)
+                    current_boxes[obj_id] = (x1, y1, x2, y2)
 
                 # ---------- UNCERTAIN ----------
 
@@ -231,6 +271,7 @@ def main():
 
                         if obj_id not in uncertain_times:
                             uncertain_times[obj_id] = time.time()
+                        uncertain_streak[obj_id] = uncertain_streak.get(obj_id, 0) + 1
 
                         duration = (
                             time.time()
@@ -241,6 +282,7 @@ def main():
 
                         if (
                             duration > UNCERTAIN_TIME
+                            and uncertain_streak.get(obj_id, 0) >= UNCERTAIN_STREAK_FRAMES
                             and (
                                 obj_id not in last_lime_time
                                 or time.time()
@@ -296,6 +338,7 @@ def main():
 
                         if obj_id in uncertain_times:
                             del uncertain_times[obj_id]
+                        uncertain_streak.pop(obj_id, None)
 
                     cv2.rectangle(
                         frame,
@@ -320,12 +363,7 @@ def main():
             for k in list(uncertain_times.keys()):
                 if k not in current_ids:
                     del uncertain_times[k]
-
-            for k in list(latest_exp.keys()):
-                if k not in current_ids:
-                    del latest_exp[k]
-                    if k in latest_exp_order:
-                        latest_exp_order.remove(k)
+                    uncertain_streak.pop(k, None)
 
             pending_lime_ids.intersection_update(current_ids)
             for k in list(pending_lime_started.keys()):
@@ -347,12 +385,70 @@ def main():
                     pending_lime_started.pop(obj_id, None)
                     if overlay is None:
                         continue
-                    latest_exp[obj_id] = overlay
-                    if obj_id in latest_exp_order:
-                        latest_exp_order.remove(obj_id)
-                    latest_exp_order.appendleft(obj_id)
+                    now_exp = time.time()
+                    exp_store[obj_id] = {
+                        "overlay": overlay,
+                        "created_at": now_exp,
+                        "last_seen": now_exp,
+                    }
+                    if obj_id in pinned_order:
+                        pinned_order.remove(obj_id)
+                    pinned_order.appendleft(obj_id)
                 except queue.Empty:
                     break
+
+            now = time.time()
+            for obj_id in current_ids:
+                if obj_id in exp_store:
+                    exp_store[obj_id]["last_seen"] = now
+
+            # Drop explanations only after age + fade and brief lost-track grace.
+            for obj_id in list(exp_store.keys()):
+                created = exp_store[obj_id]["created_at"]
+                last_seen = exp_store[obj_id]["last_seen"]
+                age = now - created
+                unseen = now - last_seen
+                if age > (EXPLANATION_HOLD_SEC + EXPLANATION_FADE_SEC) and unseen > LOST_TRACK_GRACE_SEC:
+                    del exp_store[obj_id]
+                    if obj_id in pinned_order:
+                        pinned_order.remove(obj_id)
+
+            # Blend LIME explanation directly inside each tracked bounding box.
+            for obj_id, (x1, y1, x2, y2) in current_boxes.items():
+                if obj_id not in exp_store:
+                    continue
+
+                created = exp_store[obj_id]["created_at"]
+                age = now - created
+                if age <= EXPLANATION_HOLD_SEC:
+                    alpha = INFRAME_ALPHA
+                elif age <= EXPLANATION_HOLD_SEC + EXPLANATION_FADE_SEC:
+                    t = (age - EXPLANATION_HOLD_SEC) / EXPLANATION_FADE_SEC
+                    alpha = INFRAME_ALPHA * max(0.0, 1.0 - t)
+                else:
+                    alpha = 0.0
+
+                if alpha <= 0.0:
+                    continue
+
+                h_roi = y2 - y1
+                w_roi = x2 - x1
+                if h_roi < 2 or w_roi < 2:
+                    continue
+
+                overlay = exp_store[obj_id]["overlay"]
+                overlay_resized = cv2.resize(overlay, (w_roi, h_roi), interpolation=cv2.INTER_LINEAR)
+                roi = frame[y1:y2, x1:x2]
+                frame[y1:y2, x1:x2] = cv2.addWeighted(roi, 1.0 - alpha, overlay_resized, alpha, 0)
+                cv2.putText(
+                    frame,
+                    f"LIME {int(alpha * 100)}%",
+                    (x1, y2 + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (0, 255, 255),
+                    1,
+                )
 
         # -------- FPS --------
 
@@ -375,17 +471,36 @@ def main():
             cv2.imshow("Detection", frame)
 
         # Show a single tiled window to avoid opening many OS windows (reduces lag).
-            if latest_exp_order:
-                tile_size = 160
+            if pinned_order:
+                tile_size = 192
                 cols = 2
-                rows = int(np.ceil(len(latest_exp_order) / cols))
+                active_ids = [oid for oid in list(pinned_order) if oid in exp_store]
+                if active_ids:
+                    rows = int(np.ceil(len(active_ids) / cols))
+                else:
+                    rows = 1
                 panel = np.zeros((rows * tile_size, cols * tile_size, 3), dtype=np.uint8)
 
-                for i, obj_id in enumerate(list(latest_exp_order)[:MAX_LIME_TILES]):
-                    if obj_id not in latest_exp:
-                        continue
-                    exp = latest_exp[obj_id]
-                    exp_resized = cv2.resize(exp, (tile_size, tile_size))
+                for i, obj_id in enumerate(active_ids[:MAX_LIME_TILES]):
+                    exp = exp_store[obj_id]["overlay"]
+                    age = now - exp_store[obj_id]["created_at"]
+                    if age <= EXPLANATION_HOLD_SEC:
+                        tile_alpha = 1.0
+                    elif age <= EXPLANATION_HOLD_SEC + EXPLANATION_FADE_SEC:
+                        t = (age - EXPLANATION_HOLD_SEC) / EXPLANATION_FADE_SEC
+                        tile_alpha = max(0.0, 1.0 - t)
+                    else:
+                        tile_alpha = 0.0
+
+                    exp_resized = cv2.resize(exp, (tile_size, tile_size), interpolation=cv2.INTER_LINEAR)
+                    if tile_alpha < 1.0:
+                        exp_resized = cv2.addWeighted(
+                            np.zeros_like(exp_resized),
+                            1.0 - tile_alpha,
+                            exp_resized,
+                            tile_alpha,
+                            0,
+                        )
                     r = i // cols
                     c = i % cols
                     y0 = r * tile_size
@@ -393,7 +508,7 @@ def main():
                     panel[y0:y0 + tile_size, x0:x0 + tile_size] = exp_resized
                     cv2.putText(
                         panel,
-                        f"ID {obj_id}",
+                        f"ID {obj_id}  {max(0.0, EXPLANATION_HOLD_SEC + EXPLANATION_FADE_SEC - age):.1f}s",
                         (x0 + 8, y0 + 20),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
@@ -402,14 +517,25 @@ def main():
                     )
 
                 cv2.imshow("LIME", panel)
+                lime_window_visible = True
             else:
-                try:
-                    cv2.destroyWindow("LIME")
-                except cv2.error:
-                    pass
+                if lime_window_visible:
+                    try:
+                        cv2.destroyWindow("LIME")
+                    except cv2.error:
+                        pass
+                    lime_window_visible = False
 
-            if cv2.waitKey(delay) & 0xFF == ord("q"):
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+
+            # Keep playback smooth on slow hardware by dropping a few buffered frames.
+            loop_elapsed = time.time() - curr
+            if loop_elapsed > frame_interval * 1.3:
+                drop_n = min(3, int(loop_elapsed / frame_interval) - 1)
+                for _ in range(max(0, drop_n)):
+                    if not cap.grab():
+                        break
 
     except KeyboardInterrupt:
         pass
