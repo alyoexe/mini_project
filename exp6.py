@@ -52,7 +52,8 @@ ENABLE_MEMORY_PROFILING = False  # Set to True to enable memory tracking
 PROFILE_INTERVAL = 30  # Print memory stats every N frames
 ENABLE_CROP_CACHE = True  # Cache crops to avoid redundant resizing
 ENABLE_BATCH_LIME = True  # Batch process multiple uncertain objects together
-BATCH_LIME_MAX = 3  # Max objects to batch together (higher = faster but more latency)
+BATCH_LIME_MAX = 2  # Max objects to batch together (higher = faster but more latency)
+NUM_LIME_WORKERS = 2  # Number of parallel LIME workers (1-4 recommended, higher = faster but more GPU/CPU)
 
 # ==========================================
 # UTILITY FUNCTIONS
@@ -219,8 +220,8 @@ def main():
 
     mp.set_start_method("spawn", force=True)
 
-    input_q = mp.Queue(maxsize=MAX_PENDING_JOBS)
-    output_q = mp.Queue(maxsize=MAX_PENDING_JOBS)
+    input_q = mp.Queue(maxsize=MAX_PENDING_JOBS * 2)  # Increased for multiple workers
+    output_q = mp.Queue(maxsize=MAX_PENDING_JOBS * 2)
 
     def start_worker():
         p = mp.Process(
@@ -231,7 +232,10 @@ def main():
         p.start()
         return p
 
-    worker = start_worker()
+    # Start multiple workers
+    workers = [start_worker() for _ in range(NUM_LIME_WORKERS)]
+    if NUM_LIME_WORKERS > 1:
+        print(f"Started {NUM_LIME_WORKERS} LIME workers for parallel processing")
 
     model = YOLO(MODEL_PATH, task="detect")
 
@@ -276,10 +280,12 @@ def main():
     try:
         while cap.isOpened():
 
-            if not worker.is_alive():
-                worker = start_worker()
-                pending_lime_ids.clear()
-                pending_lime_started.clear()
+            # Check and restart any dead workers
+            for i, worker in enumerate(workers):
+                if not worker.is_alive():
+                    workers[i] = start_worker()
+                    pending_lime_ids.clear()
+                    pending_lime_started.clear()
 
             if not is_paused:
                 ret, frame = cap.read()
@@ -670,9 +676,11 @@ def main():
         except queue.Full:
             pass
 
-        worker.join(timeout=2)
-        if worker.is_alive():
-            worker.terminate()
+        # Terminate all workers
+        for worker in workers:
+            worker.join(timeout=2)
+            if worker.is_alive():
+                worker.terminate()
 
         cap.release()
         cv2.destroyAllWindows()
